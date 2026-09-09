@@ -1,5 +1,5 @@
 import streamlit as st
-import joblib, mne, numpy as np
+import joblib, mne, numpy as np, tempfile
 import matplotlib.pyplot as plt
 
 st.title("Clinical EEG Seizure Dashboard")
@@ -8,10 +8,16 @@ uploaded_file = st.file_uploader("ارفع ملف رسم المخ (EDF)", type=[
 
 if uploaded_file is not None:
     try:
+        # حفظ الملف المرفوع في ملف مؤقت ليتمكن MNE من قراءته
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".edf") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_path = tmp_file.name
+
         pipe = joblib.load('eeg_pipeline.joblib')
         model, scaler = pipe['model'], pipe['scaler']
         
-        raw = mne.io.read_raw_edf(uploaded_file.name, preload=True, verbose=False)
+        # قراءة الملف من المسار المؤقت
+        raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
         raw.filter(0.5, 40.0, verbose=False)
         raw.resample(250, verbose=False)
         
