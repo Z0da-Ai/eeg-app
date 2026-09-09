@@ -3,3 +3,6 @@ mne
 scikit-learn
 joblib
 matplotlib
+numpy
+fpdf2
+
