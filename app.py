@@ -9,12 +9,12 @@ import mne
 import numpy as np
 import streamlit as st
 
-# 1. تحميل النموذج المعتمد والـ Scaler
+# 1. تحميل النموذج والـ Scaler
 pipe = joblib.load("eeg_pipeline_v2.joblib")
 model, scaler = pipe["model"], pipe["scaler"]
 
 
-# 2. إنشاء التقرير الطبي الموثق والمطابق لمعايير المستشفيات (EHR-Ready PDF)
+# 2. إنشاء التقرير الطبي المعتمد للمستشفيات (EHR-Ready PDF Report)
 def generate_clinical_pdf_report(
     is_seizure_flag,
     seizure_pct,
@@ -125,16 +125,7 @@ if uploaded_file is not None:
     with raw.info._unlock():
         raw.info["subject_info"] = None  # De-identification
 
-    # ب) المطابقة الذكية للقنوات (Universal Channel Normalizer)
-    clean_names = {}
-    for ch in raw.ch_names:
-        clean = re.sub(
-            r"(EEG|Ref|-A1|-A2|-Ref|\.)", "", ch, flags=re.IGNORECASE
-        ).strip()
-        clean_names[ch] = clean
-    raw.rename_channels(clean_names)
-
-    # ج) معالجة وتصفية الإشارة من التشويش
+    # ب) معالجة وتصفية الإشارة من التشويش
     raw.filter(0.5, 40.0, verbose=False)  # Bandpass Filter
     raw.resample(250, verbose=False)  # Standardize Sampling Rate
 
@@ -143,7 +134,7 @@ if uploaded_file is not None:
     )
     data = epochs.get_data()
 
-    # د) استخراج الخصائص الزمنية والترددية
+    # ج) استخراج الخصائص الزمنية والترددية
     mean_feat = data.mean(axis=-1)
     std_feat = data.std(axis=-1)
 
@@ -174,7 +165,7 @@ if uploaded_file is not None:
         ]
     )
 
-    # هـ) التنبؤ بالنموذج المعتمد
+    # د) التنبؤ بالنموذج المعتمد
     feats_scaled = scaler.transform(feats)
     preds = model.predict(feats_scaled)
     probs_all = model.predict_proba(feats_scaled)
@@ -190,7 +181,7 @@ if uploaded_file is not None:
         "Beta (13-30 Hz)": float(beta.mean()),
     }
 
-    # و) عرض التنبيه الإكلينيكي البارز
+    # هـ) عرض التنبيه الإكلينيكي البارز
     if is_seizure:
         st.error(
             f"🚨 **تنبيه إكلينيكي عاجل: تم اكتشاف نشاط صرعي (Seizure Detected)** | نسبة القطاعات المصابة: {seizure_pct:.1f}%"
@@ -220,13 +211,25 @@ if uploaded_file is not None:
         fig_time.savefig(tmp_plot.name, bbox_inches="tight")
         st.pyplot(fig_time)
 
-    # ز) إنشاء خريطة الجمجمة الحرارية الأوتوماتيكية (2D Topomap)
+    # و) إنشاء خريطة الجمجمة الحرارية الأوتوماتيكية (2D Topomap)
     topomap_tmp_path = None
     with col2:
         st.subheader("📍 الخريطة المكانية لنشاط المخ (2D Topomap)")
         try:
             montage = mne.channels.make_standard_montage("standard_1020")
-            raw_topo = raw.copy().set_montage(montage, on_missing="ignore")
+            raw_topo = raw.copy()
+
+            # تنظيف ومطابقة أسماء القنوات أوتوماتيكياً
+            mapping = {}
+            for ch in raw_topo.ch_names:
+                clean_name = re.sub(
+                    r"(EEG|Ref|-Ref|-A1|-A2|\.)", "", ch, flags=re.IGNORECASE
+                ).strip()
+                mapping[ch] = clean_name
+            raw_topo.rename_channels(mapping)
+
+            # تطبيق إحداثيات الـ Montage والتغاضي عن القنوات المفقودة
+            raw_topo.set_montage(montage, on_missing="ignore")
 
             fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
             mne.viz.plot_topomap(
@@ -243,11 +246,9 @@ if uploaded_file is not None:
 
             st.pyplot(fig_topo)
         except Exception as e:
-            st.warning(
-                "لم يتم العثور على القنوات القياسية الكافية لرسم الخريطة المكانية."
-            )
+            st.warning(f"تعذر رسم الخريطة المكانية: {e}")
 
-    # ح) توليد زر تحميل التقرير الطبي المعتمد
+    # ز) توليد زر تحميل التقرير الطبي المعتمد
     pdf_path = generate_clinical_pdf_report(
         is_seizure,
         seizure_pct,
