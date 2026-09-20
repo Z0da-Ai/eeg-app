@@ -1,116 +1,120 @@
-import streamlit as st
-import joblib, mne, numpy as np, tempfile, os
-import matplotlib.pyplot as plt
+import tempfile
 from fpdf import FPDF
+import joblib
+import matplotlib.pyplot as plt
+import mne
+import numpy as np
+import streamlit as st
 
-st.set_page_config(page_title="Clinical EEG Seizure Dashboard", layout="wide")
+# 1. تحميل خط المعالجة والنموذج المحدث v2
+pipe = joblib.load("eeg_pipeline_v2.joblib")
+model, scaler = pipe["model"], pipe["scaler"]
 
-st.title("⚡ Clinical EEG Seizure & XAI Dashboard")
-st.markdown("نظام الذكاء الاصطناعي المتقدم لتشخيص الصرع، تحديد البؤرة الكهربائية، واستخراج التقارير الطبية.")
 
-# دالة إنشاء تقرير PDF
-def create_pdf_report(is_seizure, avg_prob, duration_sec):
+def generate_pdf_report(diag_text, seizure_pct, num_epochs, psd_summary):
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Helvetica", 'B', 16)
-    pdf.cell(0, 10, "Clinical EEG Diagnostic Report", ln=True, align='C')
+    pdf.set_font("Helvetica", size=16, style="B")
+    pdf.cell(200, 10, txt="Clinical EEG Diagnostic Report", ln=True, align="C")
     pdf.set_font("Helvetica", size=12)
     pdf.ln(10)
-    
-    status = "Seizure Activity Detected" if is_seizure else "Normal EEG Pattern"
-    pdf.cell(0, 10, f"Diagnostic Finding: {status}", ln=True)
-    pdf.cell(0, 10, f"Average Seizure Probability: {avg_prob*100:.2f}%", ln=True)
-    pdf.cell(0, 10, f"Record Duration Analyzed: {duration_sec:.1f} Seconds", ln=True)
-    pdf.ln(10)
-    pdf.cell(0, 10, "Generated automatically by Clinical EEG AI Engine.", ln=True)
-    
-    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    pdf.output(temp_pdf.name)
-    return temp_pdf.name
+    pdf.cell(200, 10, txt=f"Diagnosis: {diag_text}", ln=True)
+    pdf.cell(
+        200, 10, txt=f"Seizure Epochs Percentage: {seizure_pct:.1f}%", ln=True
+    )
+    pdf.cell(200, 10, txt=f"Total Processed Epochs: {num_epochs}", ln=True)
+    pdf.ln(5)
 
-uploaded_file = st.file_uploader("ارفع ملف رسم المخ (EDF)", type=["edf"])
+    pdf.set_font("Helvetica", size=14, style="B")
+    pdf.cell(200, 10, txt="Spectral Power Band Distribution (PSD):", ln=True)
+    pdf.set_font("Helvetica", size=11)
+    for band, val in psd_summary.items():
+        pdf.cell(200, 8, txt=f" - {band} Band Power: {val:.4f}", ln=True)
+
+    tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    pdf.output(tmp_pdf.name)
+    return tmp_pdf.name
+
+
+# 2. واجهة التطبيق عبر Streamlit
+st.title("Clinical Explainable EEG Seizure Dashboard")
+st.write(
+    "نظام تشخيص إكلينيكي مدعوم بالذكاء الاصطناعي (GroupKFold Validated + PSD Bands Analysis)"
+)
+
+uploaded_file = st.file_uploader("رفع ملف EEG (EDF Format)", type=["edf"])
 
 if uploaded_file is not None:
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".edf") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_path = tmp_file.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".edf") as tmp:
+        tmp.write(uploaded_file.getvalue())
+        tmp_path = tmp.name
 
-        pipe = joblib.load('eeg_pipeline.joblib')
-        model, scaler = pipe['model'], pipe['scaler']
-        
-        # 1. القراءة والتعديل التلقائي
-        raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
-        raw.filter(0.5, 40.0, verbose=False)
-        raw.resample(250, verbose=False)
-        
-        # 2. إعداد الخريطة والأسماء
-        raw.rename_channels({ch: ch.replace('.', '').strip() for ch in raw.ch_names})
-        raw.set_channel_types({ch: 'eeg' for ch in raw.ch_names if ch in raw.ch_names})
-        montage = mne.channels.make_standard_montage('standard_1020')
-        raw.set_montage(montage, match_case=False, on_missing='ignore')
-        
-        # 3. استخراج الخصائص والتنبؤ
-        data = mne.make_fixed_length_epochs(raw, duration=2.0, preload=True, verbose=False).get_data()
-        feats = np.hstack((data.mean(axis=-1), data.std(axis=-1)))
-        feats_scaled = scaler.transform(feats)
-        
-        preds = model.predict(feats_scaled)
-        probs = model.predict_proba(feats_scaled)[:, 1]
-        
-        avg_prob = np.mean(probs)
-        is_seizure = avg_prob > 0.5
-        duration_sec = raw.times[-1]
-        
-        # العرض الإكلينيكي
-        st.subheader("📋 التقرير التشخيصي الإكلينيكي")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if is_seizure:
-                st.error("⚠️ نشاط صرعي محتمل (Seizure Activity Detected)")
-            else:
-                st.success("✅ رسم مخ طبيعي (Normal EEG Pattern)")
-        
-        with col2:
-            st.metric(label="متوسط احتمالية الصرع", value=f"{avg_prob*100:.1f}%")
+    # معالجة ملف EDF
+    raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
+    raw.filter(0.5, 40.0, verbose=False)
+    raw.resample(250, verbose=False)
+    raw.rename_channels({ch: ch.replace(".", "").strip() for ch in raw.ch_names})
 
-        # زر تحميل التقرير PDF
-        pdf_path = create_pdf_report(is_seizure, avg_prob, duration_sec)
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                label="📄 تحميل التقرير الطبي (PDF Report)",
-                data=f,
-                file_name="EEG_Clinical_Report.pdf",
-                mime="application/pdf"
-            )
+    epochs = mne.make_fixed_length_epochs(
+        raw, duration=2.0, preload=True, verbose=False
+    )
+    data = epochs.get_data()
 
-        st.markdown("---")
-        
-        # التبويبات المتعددة
-        tab1, tab2 = st.tabs(["📈 التتبع الزمني (Temporal Tracking)", "🧠 الخريطة الحرارية للبؤرة (XAI Topomap)"])
-        
-        with tab1:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            times = np.arange(len(probs)) * 2.0
-            ax.plot(times, probs, color='#d9534f', linewidth=2, label='Seizure Probability')
-            ax.axhline(0.5, color='black', linestyle='--', label='Threshold (0.5)')
-            ax.fill_between(times, probs, 0.5, where=(probs >= 0.5), color='red', alpha=0.3)
-            ax.set_xlabel('Time (Seconds)')
-            ax.set_ylabel('Probability')
-            ax.set_title('Temporal Seizure Probability Profile (2-sec Windows)')
-            ax.legend()
-            st.pyplot(fig)
-            
-        with tab2:
-            fig_topo, ax_topo = plt.subplots(figsize=(6, 6))
-            importances = getattr(model, 'feature_importances_', np.ones(feats.shape[1]))
-            channel_imp = importances[:len(raw.ch_names)]
-            
-            im, _ = mne.viz.plot_topomap(channel_imp, raw.info, axes=ax_topo, show=False)
-            fig_topo.colorbar(im, ax=ax_topo, orientation='vertical', shrink=0.8, label='Biomarker Importance')
-            ax_topo.set_title("XAI: Topomap of Seizure Focus Importance", fontweight='bold')
-            st.pyplot(fig_topo)
-            
-    except Exception as e:
-        st.error(f"حدث خطأ أثناء معالجة الملف: {e}")
+    # استخراج الخصائص الإحصائية
+    mean_feat = data.mean(axis=-1)
+    std_feat = data.std(axis=-1)
+
+    # استخراج طاقة نطاقات التردد (PSD)
+    psd = epochs.compute_psd(fmin=0.5, fmax=40.0, verbose=False)
+    psd_data, freqs = psd.get_data(return_freqs=True)
+
+    delta = psd_data[:, :, (freqs >= 0.5) & (freqs < 4)].mean(axis=-1)
+    theta = psd_data[:, :, (freqs >= 4) & (freqs < 8)].mean(axis=-1)
+    alpha = psd_data[:, :, (freqs >= 8) & (freqs < 13)].mean(axis=-1)
+    beta = psd_data[:, :, (freqs >= 13) & (freqs <= 30)].mean(axis=-1)
+
+    feats = np.hstack((mean_feat, std_feat, delta, theta, alpha, beta))
+    feats_scaled = scaler.transform(feats)
+
+    # التنبؤ
+    preds = model.predict(feats_scaled)
+    probs = model.predict_proba(feats_scaled)[:, 1]
+
+    seizure_pct = np.mean(preds) * 100
+    is_seizure = np.mean(preds) > 0.5
+    diag = (
+        "⚠️ نشاط صرعي محتمل (Seizure Detected)"
+        if is_seizure
+        else "✅ رسم مخ طبيعي (Normal EEG)"
+    )
+
+    psd_summary = {
+        "Delta (0.5-4 Hz)": float(delta.mean()),
+        "Theta (4-8 Hz)": float(theta.mean()),
+        "Alpha (8-13 Hz)": float(alpha.mean()),
+        "Beta (13-30 Hz)": float(beta.mean()),
+    }
+
+    st.subheader(f"التشخيص النهائي: {diag}")
+    st.write(f"نسبة القطاعات المصابة: {seizure_pct:.1f}%")
+
+    # التتبع الزمني للنوبة
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(
+        np.arange(len(probs)) * 2.0,
+        probs,
+        color="red" if is_seizure else "blue",
+        linewidth=2,
+    )
+    ax.axhline(0.5, color="gray", linestyle="--")
+    ax.set_title("Temporal Seizure Probability Profile")
+    ax.set_xlabel("Time (Seconds)")
+    ax.set_ylabel("Probability")
+    st.pyplot(fig)
+
+    # تنزيل التقرير الطبي بصيغة PDF
+    pdf_path = generate_pdf_report(diag, seizure_pct, len(preds), psd_summary)
+    with open(pdf_path, "rb") as f:
+        st.download_button(
+            "📄 تنزيل التقرير الطبي المطور (PDF)", f, file_name="Clinical_EEG_Report.pdf"
+        )
