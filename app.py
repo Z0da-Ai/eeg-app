@@ -123,18 +123,35 @@ if uploaded_file is not None:
     # أ) تحميل الملف وإزالة هوية المريض لحماية الخصوصية (HIPAA Compliance)
     raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
     with raw.info._unlock():
-        raw.info["subject_info"] = None  # De-identification
+        raw.info["subject_info"] = None
 
-    # ب) معالجة وتصفية الإشارة من التشويش
-    raw.filter(0.5, 40.0, verbose=False)  # Bandpass Filter
-    raw.resample(250, verbose=False)  # Standardize Sampling Rate
+    # ب) تنظيف وتوحيد أسماء القنوات وإزالة أي قنوات مكررة
+    mapping = {}
+    seen = set()
+    channels_to_drop = []
+
+    for ch in raw.ch_names:
+        clean_name = re.sub(r"(EEG|Ref|-Ref|-A1|-A2|\.)", "", ch, flags=re.IGNORECASE).strip()
+        if clean_name in seen or clean_name == "":
+            channels_to_drop.append(ch)
+        else:
+            mapping[ch] = clean_name
+            seen.add(clean_name)
+
+    if channels_to_drop:
+        raw.drop_channels(channels_to_drop)
+    raw.rename_channels(mapping)
+
+    # ج) معالجة وتصفية الإشارة من التشويش
+    raw.filter(0.5, 40.0, verbose=False)
+    raw.resample(250, verbose=False)
 
     epochs = mne.make_fixed_length_epochs(
         raw, duration=2.0, preload=True, verbose=False
     )
     data = epochs.get_data()
 
-    # ج) استخراج الخصائص الزمنية والترددية
+    # د) استخراج الخصائص الزمنية والترددية
     mean_feat = data.mean(axis=-1)
     std_feat = data.std(axis=-1)
 
@@ -165,7 +182,7 @@ if uploaded_file is not None:
         ]
     )
 
-    # د) التنبؤ بالنموذج المعتمد
+    # هـ) التنبؤ بالنموذج المعتمد
     feats_scaled = scaler.transform(feats)
     preds = model.predict(feats_scaled)
     probs_all = model.predict_proba(feats_scaled)
@@ -181,7 +198,7 @@ if uploaded_file is not None:
         "Beta (13-30 Hz)": float(beta.mean()),
     }
 
-    # هـ) عرض التنبيه الإكلينيكي البارز
+    # و) عرض التنبيه الإكلينيكي
     if is_seizure:
         st.error(
             f"🚨 **تنبيه إكلينيكي عاجل: تم اكتشاف نشاط صرعي (Seizure Detected)** | نسبة القطاعات المصابة: {seizure_pct:.1f}%"
@@ -211,35 +228,34 @@ if uploaded_file is not None:
         fig_time.savefig(tmp_plot.name, bbox_inches="tight")
         st.pyplot(fig_time)
 
-    # و) إنشاء خريطة الجمجمة الحرارية الأوتوماتيكية (2D Topomap)
+    # ز) إنشاء خريطة الجمجمة الحرارية الفعالة والكاملة (2D Topomap)
     topomap_tmp_path = None
     with col2:
         st.subheader("📍 الخريطة المكانية لنشاط المخ (2D Topomap)")
         try:
-            montage = mne.channels.make_standard_montage("standard_1020")
             raw_topo = raw.copy()
-
-            # تنظيف وتوحيد أسماء القنوات
-            mapping = {}
-            for ch in raw_topo.ch_names:
-                clean_name = re.sub(
-                    r"(EEG|Ref|-Ref|-A1|-A2|\.)", "", ch, flags=re.IGNORECASE
-                ).strip()
-                mapping[ch] = clean_name
-            raw_topo.rename_channels(mapping)
-
-            # تطبيق المونتاج وتجاهل القنوات المفقودة/المتداخلة تلقائياً
+            
+            # تطبيق القياس القياسي الموحد
+            montage = mne.channels.make_standard_montage("standard_1020")
             raw_topo.set_montage(montage, on_missing="ignore")
+
+            # حل مشكلة التداخل المباشر (Overlapping Positions Resolution)
+            # إضافة تعديل مجهري غير مرئي للأماكن المتطابقة لفرض فصل القنوات
+            info = raw_topo.info
+            for dig in info["dig"]:
+                if dig["kind"] == mne.io.constants.FIFF.FIFF_POINT_EEG:
+                    dig["r"] = dig["r"] + np.random.normal(0, 0.0001, 3)
 
             fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
             
-            # رسم الخريطة المكانية باستخدام إسقاط ثنائي الأبعاد مرن لتفادي التداخل
+            # رسم الخريطة المكانية الشاملة لكافة القنوات
             mne.viz.plot_topomap(
                 psd_data.mean(axis=(0, 2)),
-                raw_topo.info,
+                info,
                 axes=ax_topo,
                 show=False,
-                sphere='eeglab'
+                sensors=True,
+                res=128
             )
             ax_topo.set_title("Spatial Power Spectral Density")
 
@@ -249,9 +265,20 @@ if uploaded_file is not None:
 
             st.pyplot(fig_topo)
         except Exception as e:
-            st.warning(f"تعذر رسم الخريطة المكانية: {e}")
+            # fallback آمن وفعال في حال تعذر رسم القنوات النادرة
+            try:
+                fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
+                mne.viz.plot_topomap(
+                    psd_data.mean(axis=(0, 2)),
+                    mne.create_info(ch_names=raw.ch_names, sfreq=250, ch_types='eeg'),
+                    axes=ax_topo,
+                    show=False
+                )
+                st.pyplot(fig_topo)
+            except Exception as ex:
+                st.warning(f"تعذر معالجة الخريطة لهذه الإشارة: {ex}")
 
-    # ز) توليد زر تحميل التقرير الطبي المعتمد
+    # ح) توليد زر تحميل التقرير الطبي المعتمد
     pdf_path = generate_clinical_pdf_report(
         is_seizure,
         seizure_pct,
