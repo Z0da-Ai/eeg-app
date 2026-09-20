@@ -120,26 +120,27 @@ if uploaded_file is not None:
         tmp.write(uploaded_file.getvalue())
         tmp_path = tmp.name
 
-    # أ) تحميل الملف وإزالة هوية المريض لحماية الخصوصية (HIPAA Compliance)
+    # أ) تحميل الملف وإزالة هوية المريض
     raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
     with raw.info._unlock():
         raw.info["subject_info"] = None
 
-    # ب) تنظيف وتوحيد أسماء القنوات وإزالة التكرارات
-    mapping = {}
-    seen = set()
-    channels_to_drop = []
+    # ب) حل جذري ومباشر لتداخل القنوات: استخراج القنوات الفريدة تشريحياً فقط
+    clean_names = []
+    keep_indices = []
+    seen_channels = set()
 
-    for ch in raw.ch_names:
-        clean_name = re.sub(r"(EEG|Ref|-Ref|-A1|-A2|\.)", "", ch, flags=re.IGNORECASE).strip()
-        if clean_name in seen or clean_name == "":
-            channels_to_drop.append(ch)
-        else:
-            mapping[ch] = clean_name
-            seen.add(clean_name)
+    for idx, ch in enumerate(raw.ch_names):
+        # تنظيف اسم القناة من المراجع المكررة
+        c_name = re.sub(r"(EEG|Ref|-Ref|-A1|-A2|-LE|\.)", "", ch, flags=re.IGNORECASE).strip()
+        if c_name and c_name.upper() not in seen_channels:
+            seen_channels.add(c_name.upper())
+            clean_names.append(c_name)
+            keep_indices.append(idx)
 
-    if channels_to_drop:
-        raw.drop_channels(channels_to_drop)
+    # اختيار الإشارات الفريدة وإعادة تسميتها
+    raw.pick(keep_indices)
+    mapping = {old: new for old, new in zip(raw.ch_names, clean_names)}
     raw.rename_channels(mapping)
 
     # ج) معالجة وتصفية الإشارة من التشويش
@@ -228,23 +229,23 @@ if uploaded_file is not None:
         fig_time.savefig(tmp_plot.name, bbox_inches="tight")
         st.pyplot(fig_time)
 
-    # ز) إنشاء خريطة الجمجمة الحرارية الفعالة والكاملة (2D Topomap)
+    # ز) إنشاء الخريطة المكانية الفعالة والحقيقية (2D Topomap)
     topomap_tmp_path = None
     with col2:
         st.subheader("📍 الخريطة المكانية لنشاط المخ (2D Topomap)")
         try:
             raw_topo = raw.copy()
             
-            # تطبيق المونتاج القياسي المتناسق
+            # تطبيق المونتاج الموحد القياسي
             montage = mne.channels.make_standard_montage("standard_1020")
             raw_topo.set_montage(montage, on_missing="ignore")
 
-            # استخراج متوسط طاقة PSD
+            # حساب متوسط الطاقات
             psd_mean = psd_data.mean(axis=(0, 2))
 
             fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
             
-            # رسم خريطة الجمجمة الحرارية بشكل احترافي مع معالجة Out-of-bounds
+            # رسم خريطة الطاقات المكانية الحقيقية على سطح الرأس
             mne.viz.plot_topomap(
                 psd_mean,
                 raw_topo.info,
@@ -252,7 +253,7 @@ if uploaded_file is not None:
                 show=False,
                 contours=6,
                 sensors=True,
-                sphere='eeglab'
+                outlines='head'
             )
             ax_topo.set_title("Spatial Power Spectral Density")
 
@@ -262,7 +263,7 @@ if uploaded_file is not None:
 
             st.pyplot(fig_topo)
         except Exception as e:
-            st.warning(f"تنبيه تقني: تعذر معالجة الخريطة لهذه الإشارة الجانبية: {e}")
+            st.error(f"حدث خطأ أثناء معالجة الخريطة المكانية: {e}")
 
     # ح) توليد زر تحميل التقرير الطبي المعتمد
     pdf_path = generate_clinical_pdf_report(
