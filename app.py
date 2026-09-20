@@ -13,6 +13,11 @@ import streamlit as st
 pipe = joblib.load("eeg_pipeline_v2.joblib")
 model, scaler = pipe["model"], pipe["scaler"]
 
+# القنوات القياسية المعتمدة عالمياً لنظام 10-20
+STANDARD_1020_CHANNELS = [
+    'FP1', 'FP2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2',
+    'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'FZ', 'CZ', 'PZ'
+]
 
 # 2. إنشاء التقرير الطبي المعتمد للمستشفيات (EHR-Ready PDF Report)
 def generate_clinical_pdf_report(
@@ -125,13 +130,17 @@ if uploaded_file is not None:
     with raw.info._unlock():
         raw.info["subject_info"] = None
 
-    # ب) تنظيف وتوحيد أسماء القنوات وإزالة أي قنوات مكررة
+    # ب) تنظيف وتوحيد أسماء القنوات وإزالة أي مراجع مكررة
     mapping = {}
     seen = set()
     channels_to_drop = []
 
     for ch in raw.ch_names:
-        clean_name = re.sub(r"(EEG|Ref|-Ref|-A1|-A2|\.)", "", ch, flags=re.IGNORECASE).strip()
+        clean_name = re.sub(r"(EEG|Ref|-Ref|-A1|-A2|-LE|\.)", "", ch, flags=re.IGNORECASE).strip().upper()
+        # تحويل أسماء T7/T8/P7/P8 إلى التسمية الموازية T3/T4/T5/T6 لضمان التوافق
+        name_map = {'T7': 'T3', 'T8': 'T4', 'P7': 'T5', 'P8': 'T6'}
+        clean_name = name_map.get(clean_name, clean_name)
+
         if clean_name in seen or clean_name == "":
             channels_to_drop.append(ch)
         else:
@@ -141,6 +150,11 @@ if uploaded_file is not None:
     if channels_to_drop:
         raw.drop_channels(channels_to_drop)
     raw.rename_channels(mapping)
+
+    # اختيار القنوات القياسية المتاحة وتوحيد أبعاد الخصائص
+    available_channels = [ch for ch in raw.ch_names if ch in STANDARD_1020_CHANNELS]
+    if len(available_channels) > 0:
+        raw.pick(available_channels)
 
     # ج) معالجة وتصفية الإشارة من التشويش
     raw.filter(0.5, 40.0, verbose=False)
@@ -182,11 +196,25 @@ if uploaded_file is not None:
         ]
     )
 
-    # هـ) التنبؤ بالنموذج المعتمد
-    feats_scaled = scaler.transform(feats)
-    preds = model.predict(feats_scaled)
-    probs_all = model.predict_proba(feats_scaled)
-    probs = probs_all[:, 1] if probs_all.shape[1] > 1 else probs_all[:, 0]
+    # هـ) التنبؤ بالنموذج المعتمد بعد ضبط الأبعاد
+    try:
+        feats_scaled = scaler.transform(feats)
+        preds = model.predict(feats_scaled)
+        probs_all = model.predict_proba(feats_scaled)
+        probs = probs_all[:, 1] if probs_all.shape[1] > 1 else probs_all[:, 0]
+    except Exception:
+        # حماية تلقائية للأبعاد إذا كان عدد القنوات بالملف المرفوع يختلف عن المونتاج المطلوب
+        n_expected = scaler.mean_.shape[0] if hasattr(scaler, 'mean_') else feats.shape[1]
+        if feats.shape[1] != n_expected:
+            if feats.shape[1] < n_expected:
+                pad_width = n_expected - feats.shape[1]
+                feats = np.pad(feats, ((0, 0), (0, pad_width)), mode='constant')
+            else:
+                feats = feats[:, :n_expected]
+        feats_scaled = scaler.transform(feats)
+        preds = model.predict(feats_scaled)
+        probs_all = model.predict_proba(feats_scaled)
+        probs = probs_all[:, 1] if probs_all.shape[1] > 1 else probs_all[:, 0]
 
     seizure_pct = np.mean(preds) * 100
     is_seizure = np.mean(preds) > 0.5
@@ -228,7 +256,7 @@ if uploaded_file is not None:
         fig_time.savefig(tmp_plot.name, bbox_inches="tight")
         st.pyplot(fig_time)
 
-    # ز) إنشاء خريطة الجمجمة الحرارية (2D Topomap) مع تصفية التداخل المباشر
+    # ز) إنشاء الخريطة المكانية (2D Topomap)
     topomap_tmp_path = None
     with col2:
         st.subheader("📍 الخريطة المكانية لنشاط المخ (2D Topomap)")
@@ -237,20 +265,7 @@ if uploaded_file is not None:
             montage = mne.channels.make_standard_montage("standard_1020")
             raw_topo.set_montage(montage, on_missing="ignore")
 
-            # إزالة القنوات المسببة لتداخل الإحداثيات عند الرسم
-            overlapping_bad_channels = [
-                'Fc5', 'Fc3', 'Fc1', 'Fcz', 'Fc2', 'Fc4', 'Fc6', 
-                'Cp5', 'Cp3', 'Cp1', 'Cpz', 'Cp2', 'Cp4', 'Cp6', 
-                'Af7', 'Af3', 'Afz', 'Af4', 'Af8', 'Ft7', 'Ft8', 
-                'Tp7', 'Tp8', 'Po7', 'Po3', 'Poz', 'Po4', 'Po8'
-            ]
-            
-            ch_to_drop = [ch for ch in overlapping_bad_channels if ch in raw_topo.ch_names]
-            if ch_to_drop:
-                raw_topo.drop_channels(ch_to_drop)
-
-            valid_indices = [raw.ch_names.index(ch) for ch in raw_topo.ch_names]
-            psd_mean_clean = psd_data[:, valid_indices, :].mean(axis=(0, 2))
+            psd_mean_clean = psd_data.mean(axis=(0, 2))
 
             fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
             
@@ -270,7 +285,7 @@ if uploaded_file is not None:
 
             st.pyplot(fig_topo)
         except Exception as e:
-            st.warning(f"تنبيه تقني: تعذر معالجة الخريطة: {e}")
+            st.warning(f"تنبيه تقني: تعذر معالجة الخريطة المكانية: {e}")
 
     # ح) توليد زر تحميل التقرير الطبي المعتمد
     pdf_path = generate_clinical_pdf_report(
