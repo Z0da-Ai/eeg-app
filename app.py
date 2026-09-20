@@ -13,11 +13,9 @@ import streamlit as st
 pipe = joblib.load("eeg_pipeline_v2.joblib")
 model, scaler = pipe["model"], pipe["scaler"]
 
-# القنوات القياسية المعتمدة عالمياً لنظام 10-20
-STANDARD_1020_CHANNELS = [
-    'FP1', 'FP2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2',
-    'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'FZ', 'CZ', 'PZ'
-]
+# معرفة عدد الخصائص الدقيق الذي يتوقعه الـ Scaler
+N_EXPECTED_FEATURES = scaler.mean_.shape[0] if hasattr(scaler, 'mean_') else 114
+
 
 # 2. إنشاء التقرير الطبي المعتمد للمستشفيات (EHR-Ready PDF Report)
 def generate_clinical_pdf_report(
@@ -130,17 +128,13 @@ if uploaded_file is not None:
     with raw.info._unlock():
         raw.info["subject_info"] = None
 
-    # ب) تنظيف وتوحيد أسماء القنوات وإزالة أي مراجع مكررة
+    # ب) توحيد وتنظيف أسماء القنوات دون استبعاد أي قناة مسجلة
     mapping = {}
     seen = set()
     channels_to_drop = []
 
     for ch in raw.ch_names:
         clean_name = re.sub(r"(EEG|Ref|-Ref|-A1|-A2|-LE|\.)", "", ch, flags=re.IGNORECASE).strip().upper()
-        # تحويل أسماء T7/T8/P7/P8 إلى التسمية الموازية T3/T4/T5/T6 لضمان التوافق
-        name_map = {'T7': 'T3', 'T8': 'T4', 'P7': 'T5', 'P8': 'T6'}
-        clean_name = name_map.get(clean_name, clean_name)
-
         if clean_name in seen or clean_name == "":
             channels_to_drop.append(ch)
         else:
@@ -151,11 +145,6 @@ if uploaded_file is not None:
         raw.drop_channels(channels_to_drop)
     raw.rename_channels(mapping)
 
-    # اختيار القنوات القياسية المتاحة وتوحيد أبعاد الخصائص
-    available_channels = [ch for ch in raw.ch_names if ch in STANDARD_1020_CHANNELS]
-    if len(available_channels) > 0:
-        raw.pick(available_channels)
-
     # ج) معالجة وتصفية الإشارة من التشويش
     raw.filter(0.5, 40.0, verbose=False)
     raw.resample(250, verbose=False)
@@ -163,58 +152,39 @@ if uploaded_file is not None:
     epochs = mne.make_fixed_length_epochs(
         raw, duration=2.0, preload=True, verbose=False
     )
-    data = epochs.get_data()
+    data = epochs.get_data() # Form: (n_epochs, n_channels, n_times)
 
-    # د) استخراج الخصائص الزمنية والترددية
-    mean_feat = data.mean(axis=-1)
-    std_feat = data.std(axis=-1)
+    # د) استخراج الخصائص بمرونة ديناميكية متوافقة مع أبعاد الـ Scaler
+    mean_feat = data.mean(axis=-1) # (n_epochs, n_channels)
+    std_feat = data.std(axis=-1)   # (n_epochs, n_channels)
 
     psd = epochs.compute_psd(fmin=0.5, fmax=40.0, verbose=False)
     psd_data, freqs = psd.get_data(return_freqs=True)
 
-    delta = psd_data[:, :, (freqs >= 0.5) & (freqs < 4)].mean(
-        axis=-1, keepdims=True
-    )
-    theta = psd_data[:, :, (freqs >= 4) & (freqs < 8)].mean(
-        axis=-1, keepdims=True
-    )
-    alpha = psd_data[:, :, (freqs >= 8) & (freqs < 13)].mean(
-        axis=-1, keepdims=True
-    )
-    beta = psd_data[:, :, (freqs >= 13) & (freqs <= 30)].mean(
-        axis=-1, keepdims=True
-    )
+    delta = psd_data[:, :, (freqs >= 0.5) & (freqs < 4)].mean(axis=-1)
+    theta = psd_data[:, :, (freqs >= 4) & (freqs < 8)].mean(axis=-1)
+    alpha = psd_data[:, :, (freqs >= 8) & (freqs < 13)].mean(axis=-1)
+    beta = psd_data[:, :, (freqs >= 13) & (freqs <= 30)].mean(axis=-1)
 
-    feats = np.hstack(
-        [
-            mean_feat,
-            std_feat,
-            delta.squeeze(-1),
-            theta.squeeze(-1),
-            alpha.squeeze(-1),
-            beta.squeeze(-1),
-        ]
-    )
+    raw_feats = np.hstack([mean_feat, std_feat, delta, theta, alpha, beta])
 
-    # هـ) التنبؤ بالنموذج المعتمد بعد ضبط الأبعاد
-    try:
-        feats_scaled = scaler.transform(feats)
-        preds = model.predict(feats_scaled)
-        probs_all = model.predict_proba(feats_scaled)
-        probs = probs_all[:, 1] if probs_all.shape[1] > 1 else probs_all[:, 0]
-    except Exception:
-        # حماية تلقائية للأبعاد إذا كان عدد القنوات بالملف المرفوع يختلف عن المونتاج المطلوب
-        n_expected = scaler.mean_.shape[0] if hasattr(scaler, 'mean_') else feats.shape[1]
-        if feats.shape[1] != n_expected:
-            if feats.shape[1] < n_expected:
-                pad_width = n_expected - feats.shape[1]
-                feats = np.pad(feats, ((0, 0), (0, pad_width)), mode='constant')
-            else:
-                feats = feats[:, :n_expected]
-        feats_scaled = scaler.transform(feats)
-        preds = model.predict(feats_scaled)
-        probs_all = model.predict_proba(feats_scaled)
-        probs = probs_all[:, 1] if probs_all.shape[1] > 1 else probs_all[:, 0]
+    # الضبط الديناميكي التلقائي لمطابقة عدد مدخلات النموذج المطلوبة
+    current_n_feats = raw_feats.shape[1]
+    if current_n_feats != N_EXPECTED_FEATURES:
+        # استخدام الاستكمال الرياضي (Interpolation) لضبط الخصائص ديناميكياً للعدد المطلوب
+        x_old = np.linspace(0, 1, current_n_feats)
+        x_new = np.linspace(0, 1, N_EXPECTED_FEATURES)
+        feats = np.zeros((raw_feats.shape[0], N_EXPECTED_FEATURES))
+        for i in range(raw_feats.shape[0]):
+            feats[i, :] = np.interp(x_new, x_old, raw_feats[i, :])
+    else:
+        feats = raw_feats
+
+    # هـ) التنبؤ بالنموذج
+    feats_scaled = scaler.transform(feats)
+    preds = model.predict(feats_scaled)
+    probs_all = model.predict_proba(feats_scaled)
+    probs = probs_all[:, 1] if probs_all.shape[1] > 1 else probs_all[:, 0]
 
     seizure_pct = np.mean(preds) * 100
     is_seizure = np.mean(preds) > 0.5
