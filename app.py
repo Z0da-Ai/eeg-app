@@ -219,7 +219,7 @@ if uploaded_file is not None:
             montage = mne.channels.make_standard_montage("standard_1020")
             raw_topo = raw.copy()
 
-            # تنظيف ومطابقة أسماء القنوات أوتوماتيكياً
+            # تنظيف وتوحيد أسماء القنوات
             mapping = {}
             for ch in raw_topo.ch_names:
                 clean_name = re.sub(
@@ -228,15 +228,18 @@ if uploaded_file is not None:
                 mapping[ch] = clean_name
             raw_topo.rename_channels(mapping)
 
-            # تطبيق إحداثيات الـ Montage والتغاضي عن القنوات المفقودة
+            # تطبيق المونتاج وتجاهل القنوات المفقودة/المتداخلة تلقائياً
             raw_topo.set_montage(montage, on_missing="ignore")
 
             fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
+            
+            # رسم الخريطة المكانية باستخدام إسقاط ثنائي الأبعاد مرن لتفادي التداخل
             mne.viz.plot_topomap(
                 psd_data.mean(axis=(0, 2)),
                 raw_topo.info,
                 axes=ax_topo,
                 show=False,
+                sphere='eeglab'
             )
             ax_topo.set_title("Spatial Power Spectral Density")
 
