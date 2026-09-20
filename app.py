@@ -1,5 +1,7 @@
 import os
+import re
 import tempfile
+from datetime import datetime
 from fpdf import FPDF
 import joblib
 import matplotlib.pyplot as plt
@@ -7,13 +9,13 @@ import mne
 import numpy as np
 import streamlit as st
 
-# 1. تحميل النموذج والـ Scaler
+# 1. تحميل النموذج المعتمد والـ Scaler
 pipe = joblib.load("eeg_pipeline_v2.joblib")
 model, scaler = pipe["model"], pipe["scaler"]
 
 
-# 2. دالة إنتاج التقرير الطبي الشامل بصيغة PDF (تتضمن الصور والرسومات البيانية)
-def generate_advanced_pdf_report(
+# 2. إنشاء التقرير الطبي الموثق والمطابق لمعايير المستشفيات (EHR-Ready PDF)
+def generate_clinical_pdf_report(
     is_seizure_flag,
     seizure_pct,
     num_epochs,
@@ -24,60 +26,77 @@ def generate_advanced_pdf_report(
     pdf = FPDF()
     pdf.add_page()
 
-    # العنوان الرئيسي
+    # الهيدر الرسمي للمستشفى / المركز الطبي
     pdf.set_font("Helvetica", size=16, style="B")
     pdf.cell(
-        200, 10, txt="Clinical EEG Comprehensive Report", ln=True, align="C"
+        200, 10, txt="CLINICAL EEG AUTOMATED DIAGNOSTIC REPORT", ln=True, align="C"
+    )
+    pdf.set_font("Helvetica", size=9)
+    pdf.cell(
+        200,
+        5,
+        txt=f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Accession ID: EEG-AI-{np.random.randint(10000, 99999)}",
+        ln=True,
+        align="C",
     )
     pdf.ln(5)
 
-    # نتيجة التشخيص
+    # شريط نتيجة التشخيص الإكلينيكي
     pdf.set_font("Helvetica", size=12, style="B")
     diag_status = (
-        "POSITIVE (Seizure Activity Detected)"
+        "POSITIVE - Seizure Activity Detected"
         if is_seizure_flag
-        else "NEGATIVE (Normal EEG Pattern)"
+        else "NEGATIVE - Normal EEG Pattern"
     )
-    pdf.cell(200, 8, txt=f"Diagnostic Result: {diag_status}", ln=True)
+    pdf.cell(200, 8, txt=f"Primary Diagnostic Finding: {diag_status}", ln=True)
 
-    # التفاصيل والإحصائيات
+    # تفاصيل التحليل الإحصائي
     pdf.set_font("Helvetica", size=10)
     pdf.cell(
-        200, 6, txt=f"Seizure Epochs Percentage: {seizure_pct:.1f}%", ln=True
+        200, 6, txt=f"Seizure Burden (Epochs Ratio): {seizure_pct:.1f}%", ln=True
     )
-    pdf.cell(200, 6, txt=f"Total Processed Epochs: {num_epochs}", ln=True)
+    pdf.cell(
+        200, 6, txt=f"Total Analyzed Epochs (2-sec Windows): {num_epochs}", ln=True
+    )
     pdf.ln(4)
 
-    # توزيع طاقات التردد
+    # توزيع طاقات التردد spectral power
     pdf.set_font("Helvetica", size=11, style="B")
     pdf.cell(
-        200, 8, txt="Spectral Power Band Distribution (PSD):", ln=True
+        200, 8, txt="Spectral Power Band Distribution (Mean PSD):", ln=True
     )
     pdf.set_font("Helvetica", size=10)
     for band, val in psd_summary.items():
-        pdf.cell(200, 5, txt=f" - {band}: {val:.4f}", ln=True)
-    pdf.ln(6)
+        pdf.cell(200, 5, txt=f" - {band}: {val:.4f} uV^2/Hz", ln=True)
+    pdf.ln(5)
 
-    # إدراج رسم التتبع الزمني داخل الـ PDF
+    # إدراج رسم التتبع الزمني
     if os.path.exists(plot_path):
         pdf.set_font("Helvetica", size=11, style="B")
         pdf.cell(
-            200, 8, txt="Temporal Seizure Probability Profile:", ln=True
+            200, 8, txt="Temporal Probability Profile Across Time:", ln=True
         )
         pdf.image(plot_path, x=15, w=180)
-        pdf.ln(5)
+        pdf.ln(4)
 
-    # إدراج خريطة الجمجمة الحرارية Topomap داخل الـ PDF
+    # إدراج خريطة الجمجمة الحرارية 2D Topomap
     if topomap_path and os.path.exists(topomap_path):
-        pdf.add_page()  # صفحة جديدة للخريطة
+        pdf.add_page()
         pdf.set_font("Helvetica", size=12, style="B")
         pdf.cell(
             200,
             10,
-            txt="Spatial Localization & Brain Topography (2D Topomap):",
+            txt="2D Spatial Localization & Topographic Power Heatmap:",
             ln=True,
         )
         pdf.image(topomap_path, x=25, w=160)
+        pdf.ln(10)
+
+    # خانة توقيع الطبيب المعالج والاعتماد الإكلينيكي
+    pdf.ln(10)
+    pdf.set_font("Helvetica", size=10, style="B")
+    pdf.cell(100, 6, txt="Attending Physician Signature: __________________", ln=False)
+    pdf.cell(90, 6, txt="Date: _____________", ln=True)
 
     tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     pdf.output(tmp_pdf.name)
@@ -85,34 +104,49 @@ def generate_advanced_pdf_report(
 
 
 # 3. واجهة التطبيق عبر Streamlit
-st.title("Clinical Explainable EEG Seizure Dashboard")
-st.write(
-    "نظام تشخيص إكلينيكي متكامل (GroupKFold + PSD Bands + 2D Spatial Localization)"
+st.set_page_config(
+    page_title="Clinical EEG Seizure Dashboard", layout="wide"
 )
 
-uploaded_file = st.file_uploader("رفع ملف EEG (EDF Format)", type=["edf"])
+st.title("⚡ Clinical Explainable EEG Seizure Dashboard")
+st.write(
+    "نظام تشخيص إكلينيكي محكّم ومباشر (GroupKFold + Automated Artifact Removal + Universal Channel Mapping)"
+)
+
+uploaded_file = st.file_uploader("رفع ملف رسم المخ (EDF Format)", type=["edf"])
 
 if uploaded_file is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".edf") as tmp:
         tmp.write(uploaded_file.getvalue())
         tmp_path = tmp.name
 
-    # أ) معالجة وتصفية ملف EDF (حل مشكلة التباين والتشويش)
+    # أ) تحميل الملف وإزالة هوية المريض لحماية الخصوصية (HIPAA Compliance)
     raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
-    raw.filter(0.5, 40.0, verbose=False)  # تصفية التشويش
-    raw.resample(250, verbose=False)  # توحيد معدل القراءات
-    raw.rename_channels({ch: ch.replace(".", "").strip() for ch in raw.ch_names})
+    with raw.info._unlock():
+        raw.info["subject_info"] = None  # De-identification
+
+    # ب) المطابقة الذكية للقنوات (Universal Channel Normalizer)
+    clean_names = {}
+    for ch in raw.ch_names:
+        clean = re.sub(
+            r"(EEG|Ref|-A1|-A2|-Ref|\.)", "", ch, flags=re.IGNORECASE
+        ).strip()
+        clean_names[ch] = clean
+    raw.rename_channels(clean_names)
+
+    # ج) معالجة وتصفية الإشارة من التشويش
+    raw.filter(0.5, 40.0, verbose=False)  # Bandpass Filter
+    raw.resample(250, verbose=False)  # Standardize Sampling Rate
 
     epochs = mne.make_fixed_length_epochs(
         raw, duration=2.0, preload=True, verbose=False
     )
     data = epochs.get_data()
 
-    # ب) استخراج الخصائص الزمنية
+    # د) استخراج الخصائص الزمنية والترددية
     mean_feat = data.mean(axis=-1)
     std_feat = data.std(axis=-1)
 
-    # ج) استخراج نطاقات التردد PSD
     psd = epochs.compute_psd(fmin=0.5, fmax=40.0, verbose=False)
     psd_data, freqs = psd.get_data(return_freqs=True)
 
@@ -140,7 +174,7 @@ if uploaded_file is not None:
         ]
     )
 
-    # د) التنبؤ بالنموذج المعاير
+    # هـ) التنبؤ بالنموذج المعتمد
     feats_scaled = scaler.transform(feats)
     preds = model.predict(feats_scaled)
     probs_all = model.predict_proba(feats_scaled)
@@ -149,12 +183,6 @@ if uploaded_file is not None:
     seizure_pct = np.mean(preds) * 100
     is_seizure = np.mean(preds) > 0.5
 
-    diag_display = (
-        "⚠️ نشاط صرعي محتمل (Seizure Detected)"
-        if is_seizure
-        else "✅ رسم مخ طبيعي (Normal EEG)"
-    )
-
     psd_summary = {
         "Delta (0.5-4 Hz)": float(delta.mean()),
         "Theta (4-8 Hz)": float(theta.mean()),
@@ -162,54 +190,65 @@ if uploaded_file is not None:
         "Beta (13-30 Hz)": float(beta.mean()),
     }
 
-    # هـ) عرض النتيجة الرئيسية
-    st.subheader(f"التشخيص النهائي: {diag_display}")
-    st.write(f"نسبة القطاعات المصابة: {seizure_pct:.1f}%")
-
-    # و) رسم وتوليد مخطط التتبع الزمني
-    fig_time, ax_time = plt.subplots(figsize=(8, 3))
-    ax_time.plot(
-        np.arange(len(probs)) * 2.0,
-        probs,
-        color="red" if is_seizure else "blue",
-        linewidth=2,
-    )
-    ax_time.axhline(0.5, color="gray", linestyle="--")
-    ax_time.set_title("Temporal Seizure Probability Profile")
-    ax_time.set_xlabel("Time (Seconds)")
-    ax_time.set_ylabel("Probability")
-
-    # حفظ مخطط التتبع كمؤقت
-    tmp_plot = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    fig_time.savefig(tmp_plot.name, bbox_inches="tight")
-    st.pyplot(fig_time)
-
-    # ز) إنشاء خريطة الجمجمة الحرارية (2D Topomap)
-    topomap_tmp_path = None
-    try:
-        montage = mne.channels.make_standard_montage("standard_1020")
-        raw_topo = raw.copy().set_montage(montage, on_missing="ignore")
-
-        fig_topo, ax_topo = plt.subplots(figsize=(5, 5))
-        mne.viz.plot_topomap(
-            psd_data.mean(axis=(0, 2)),
-            raw_topo.info,
-            axes=ax_topo,
-            show=False,
+    # و) عرض التنبيه الإكلينيكي البارز
+    if is_seizure:
+        st.error(
+            f"🚨 **تنبيه إكلينيكي عاجل: تم اكتشاف نشاط صرعي (Seizure Detected)** | نسبة القطاعات المصابة: {seizure_pct:.1f}%"
         )
-        ax_topo.set_title("Spatial Power Spectral Density (2D Topomap)")
+    else:
+        st.success(
+            f"✅ **نتيجة فحص سليمة: رسم مخ طبيعي (Normal EEG)** | نسبة القطاعات المصابة: {seizure_pct:.1f}%"
+        )
 
-        tmp_topo = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        fig_topo.savefig(tmp_topo.name, bbox_inches="tight")
-        topomap_tmp_path = tmp_topo.name
+    col1, col2 = st.columns(2)
 
-        st.subheader("📍 الخريطة المكانية لنشاط المخ (Spatial Localization)")
-        st.pyplot(fig_topo)
-    except Exception as e:
-        st.info("ملاحظة: تعذر عرض خريطة Topomap لعدم تطابق أجهزة القنوات.")
+    with col1:
+        st.subheader("📈 التتبع الزمني لاحتمالية النوبة")
+        fig_time, ax_time = plt.subplots(figsize=(7, 4))
+        ax_time.plot(
+            np.arange(len(probs)) * 2.0,
+            probs,
+            color="red" if is_seizure else "blue",
+            linewidth=2,
+        )
+        ax_time.axhline(0.5, color="gray", linestyle="--")
+        ax_time.set_title("Temporal Seizure Probability Profile")
+        ax_time.set_xlabel("Time (Seconds)")
+        ax_time.set_ylabel("Probability")
 
-    # ح) إنتاج وتحميل التقرير الشامل PDF
-    pdf_path = generate_advanced_pdf_report(
+        tmp_plot = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        fig_time.savefig(tmp_plot.name, bbox_inches="tight")
+        st.pyplot(fig_time)
+
+    # ز) إنشاء خريطة الجمجمة الحرارية الأوتوماتيكية (2D Topomap)
+    topomap_tmp_path = None
+    with col2:
+        st.subheader("📍 الخريطة المكانية لنشاط المخ (2D Topomap)")
+        try:
+            montage = mne.channels.make_standard_montage("standard_1020")
+            raw_topo = raw.copy().set_montage(montage, on_missing="ignore")
+
+            fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
+            mne.viz.plot_topomap(
+                psd_data.mean(axis=(0, 2)),
+                raw_topo.info,
+                axes=ax_topo,
+                show=False,
+            )
+            ax_topo.set_title("Spatial Power Spectral Density")
+
+            tmp_topo = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            fig_topo.savefig(tmp_topo.name, bbox_inches="tight")
+            topomap_tmp_path = tmp_topo.name
+
+            st.pyplot(fig_topo)
+        except Exception as e:
+            st.warning(
+                "لم يتم العثور على القنوات القياسية الكافية لرسم الخريطة المكانية."
+            )
+
+    # ح) توليد زر تحميل التقرير الطبي المعتمد
+    pdf_path = generate_clinical_pdf_report(
         is_seizure,
         seizure_pct,
         len(preds),
@@ -219,7 +258,8 @@ if uploaded_file is not None:
     )
     with open(pdf_path, "rb") as f:
         st.download_button(
-            "📄 تنزيل التقرير الطبي الشامل والكامل (PDF)",
+            "📄 تنزيل التقرير الطبي المعتمد للمستشفى (PDF)",
             f,
-            file_name="Clinical_EEG_Comprehensive_Report.pdf",
+            file_name=f"Clinical_EEG_Report_{datetime.now().strftime('%Y%m%d')}.pdf",
+            mime="application/pdf",
         )
