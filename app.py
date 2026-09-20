@@ -6,7 +6,7 @@ import mne
 import numpy as np
 import streamlit as st
 
-# 1. تحميل خط المعالجة والنموذج المحدث v2
+# 1. تحميل خط المعالجة المحدث v2
 pipe = joblib.load("eeg_pipeline_v2.joblib")
 model, scaler = pipe["model"], pipe["scaler"]
 
@@ -58,27 +58,53 @@ if uploaded_file is not None:
     epochs = mne.make_fixed_length_epochs(
         raw, duration=2.0, preload=True, verbose=False
     )
-    data = epochs.get_data()
+    data = epochs.get_data()  # Shape: (n_epochs, n_channels, n_times)
 
-    # استخراج الخصائص الإحصائية
+    # 1. استخراج الخصائص الزمنية (Mean & Std) لكل القطاعات
     mean_feat = data.mean(axis=-1)
     std_feat = data.std(axis=-1)
 
-    # استخراج طاقة نطاقات التردد (PSD)
+    # 2. استخراج طاقة نطاقات التردد (PSD)
     psd = epochs.compute_psd(fmin=0.5, fmax=40.0, verbose=False)
     psd_data, freqs = psd.get_data(return_freqs=True)
 
-    delta = psd_data[:, :, (freqs >= 0.5) & (freqs < 4)].mean(axis=-1)
-    theta = psd_data[:, :, (freqs >= 4) & (freqs < 8)].mean(axis=-1)
-    alpha = psd_data[:, :, (freqs >= 8) & (freqs < 13)].mean(axis=-1)
-    beta = psd_data[:, :, (freqs >= 13) & (freqs <= 30)].mean(axis=-1)
+    delta = psd_data[:, :, (freqs >= 0.5) & (freqs < 4)].mean(
+        axis=-1, keepdims=True
+    )
+    theta = psd_data[:, :, (freqs >= 4) & (freqs < 8)].mean(
+        axis=-1, keepdims=True
+    )
+    alpha = psd_data[:, :, (freqs >= 8) & (freqs < 13)].mean(
+        axis=-1, keepdims=True
+    )
+    beta = psd_data[:, :, (freqs >= 13) & (freqs <= 30)].mean(
+        axis=-1, keepdims=True
+    )
 
-    feats = np.hstack((mean_feat, std_feat, delta, theta, alpha, beta))
+    # تجميع الخصائص
+    feats = np.hstack(
+        [
+            mean_feat,
+            std_feat,
+            delta.squeeze(-1),
+            theta.squeeze(-1),
+            alpha.squeeze(-1),
+            beta.squeeze(-1),
+        ]
+    )
+
+    # التحقق وتعديل شكل الخصائص لتطابق التوقع
     feats_scaled = scaler.transform(feats)
 
     # التنبؤ
     preds = model.predict(feats_scaled)
-    probs = model.predict_proba(feats_scaled)[:, 1]
+    probs_all = model.predict_proba(feats_scaled)
+
+    # معالجة الاحتمالات بأمان لمنع IndexError
+    if probs_all.shape[1] > 1:
+        probs = probs_all[:, 1]
+    else:
+        probs = probs_all[:, 0]
 
     seizure_pct = np.mean(preds) * 100
     is_seizure = np.mean(preds) > 0.5
@@ -112,9 +138,11 @@ if uploaded_file is not None:
     ax.set_ylabel("Probability")
     st.pyplot(fig)
 
-    # تنزيل التقرير الطبي بصيغة PDF
+    # تنزيل التقرير الطبي
     pdf_path = generate_pdf_report(diag, seizure_pct, len(preds), psd_summary)
     with open(pdf_path, "rb") as f:
         st.download_button(
-            "📄 تنزيل التقرير الطبي المطور (PDF)", f, file_name="Clinical_EEG_Report.pdf"
+            "📄 تنزيل التقرير الطبي المطور (PDF)",
+            f,
+            file_name="Clinical_EEG_Report.pdf",
         )
