@@ -125,7 +125,7 @@ if uploaded_file is not None:
     with raw.info._unlock():
         raw.info["subject_info"] = None
 
-    # ب) تنظيف وتوحيد أسماء القنوات وإزالة أي قنوات مكررة
+    # ب) تنظيف وتوحيد أسماء القنوات وإزالة التكرارات
     mapping = {}
     seen = set()
     channels_to_drop = []
@@ -235,27 +235,24 @@ if uploaded_file is not None:
         try:
             raw_topo = raw.copy()
             
-            # تطبيق القياس القياسي الموحد
+            # تطبيق المونتاج القياسي المتناسق
             montage = mne.channels.make_standard_montage("standard_1020")
             raw_topo.set_montage(montage, on_missing="ignore")
 
-            # حل مشكلة التداخل المباشر (Overlapping Positions Resolution)
-            # إضافة تعديل مجهري غير مرئي للأماكن المتطابقة لفرض فصل القنوات
-            info = raw_topo.info
-            for dig in info["dig"]:
-                if dig["kind"] == mne.io.constants.FIFF.FIFF_POINT_EEG:
-                    dig["r"] = dig["r"] + np.random.normal(0, 0.0001, 3)
+            # استخراج متوسط طاقة PSD
+            psd_mean = psd_data.mean(axis=(0, 2))
 
             fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
             
-            # رسم الخريطة المكانية الشاملة لكافة القنوات
+            # رسم خريطة الجمجمة الحرارية بشكل احترافي مع معالجة Out-of-bounds
             mne.viz.plot_topomap(
-                psd_data.mean(axis=(0, 2)),
-                info,
+                psd_mean,
+                raw_topo.info,
                 axes=ax_topo,
                 show=False,
+                contours=6,
                 sensors=True,
-                res=128
+                sphere='eeglab'
             )
             ax_topo.set_title("Spatial Power Spectral Density")
 
@@ -265,18 +262,7 @@ if uploaded_file is not None:
 
             st.pyplot(fig_topo)
         except Exception as e:
-            # fallback آمن وفعال في حال تعذر رسم القنوات النادرة
-            try:
-                fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
-                mne.viz.plot_topomap(
-                    psd_data.mean(axis=(0, 2)),
-                    mne.create_info(ch_names=raw.ch_names, sfreq=250, ch_types='eeg'),
-                    axes=ax_topo,
-                    show=False
-                )
-                st.pyplot(fig_topo)
-            except Exception as ex:
-                st.warning(f"تعذر معالجة الخريطة لهذه الإشارة: {ex}")
+            st.warning(f"تنبيه تقني: تعذر معالجة الخريطة لهذه الإشارة الجانبية: {e}")
 
     # ح) توليد زر تحميل التقرير الطبي المعتمد
     pdf_path = generate_clinical_pdf_report(
