@@ -125,22 +125,21 @@ if uploaded_file is not None:
     with raw.info._unlock():
         raw.info["subject_info"] = None
 
-    # ب) حل جذري ومباشر لتداخل القنوات: استخراج القنوات الفريدة تشريحياً فقط
-    clean_names = []
-    keep_indices = []
-    seen_channels = set()
+    # ب) تنظيف وتوحيد أسماء القنوات وإزالة أي قنوات مكررة
+    mapping = {}
+    seen = set()
+    channels_to_drop = []
 
-    for idx, ch in enumerate(raw.ch_names):
-        # تنظيف اسم القناة من المراجع المكررة
-        c_name = re.sub(r"(EEG|Ref|-Ref|-A1|-A2|-LE|\.)", "", ch, flags=re.IGNORECASE).strip()
-        if c_name and c_name.upper() not in seen_channels:
-            seen_channels.add(c_name.upper())
-            clean_names.append(c_name)
-            keep_indices.append(idx)
+    for ch in raw.ch_names:
+        clean_name = re.sub(r"(EEG|Ref|-Ref|-A1|-A2|\.)", "", ch, flags=re.IGNORECASE).strip()
+        if clean_name in seen or clean_name == "":
+            channels_to_drop.append(ch)
+        else:
+            mapping[ch] = clean_name
+            seen.add(clean_name)
 
-    # اختيار الإشارات الفريدة وإعادة تسميتها
-    raw.pick(keep_indices)
-    mapping = {old: new for old, new in zip(raw.ch_names, clean_names)}
+    if channels_to_drop:
+        raw.drop_channels(channels_to_drop)
     raw.rename_channels(mapping)
 
     # ج) معالجة وتصفية الإشارة من التشويش
@@ -229,31 +228,39 @@ if uploaded_file is not None:
         fig_time.savefig(tmp_plot.name, bbox_inches="tight")
         st.pyplot(fig_time)
 
-    # ز) إنشاء الخريطة المكانية الفعالة والحقيقية (2D Topomap)
+    # ز) إنشاء خريطة الجمجمة الحرارية (2D Topomap) مع تصفية التداخل المباشر
     topomap_tmp_path = None
     with col2:
         st.subheader("📍 الخريطة المكانية لنشاط المخ (2D Topomap)")
         try:
             raw_topo = raw.copy()
-            
-            # تطبيق المونتاج الموحد القياسي
             montage = mne.channels.make_standard_montage("standard_1020")
             raw_topo.set_montage(montage, on_missing="ignore")
 
-            # حساب متوسط الطاقات
-            psd_mean = psd_data.mean(axis=(0, 2))
+            # إزالة القنوات المسببة لتداخل الإحداثيات عند الرسم
+            overlapping_bad_channels = [
+                'Fc5', 'Fc3', 'Fc1', 'Fcz', 'Fc2', 'Fc4', 'Fc6', 
+                'Cp5', 'Cp3', 'Cp1', 'Cpz', 'Cp2', 'Cp4', 'Cp6', 
+                'Af7', 'Af3', 'Afz', 'Af4', 'Af8', 'Ft7', 'Ft8', 
+                'Tp7', 'Tp8', 'Po7', 'Po3', 'Poz', 'Po4', 'Po8'
+            ]
+            
+            ch_to_drop = [ch for ch in overlapping_bad_channels if ch in raw_topo.ch_names]
+            if ch_to_drop:
+                raw_topo.drop_channels(ch_to_drop)
+
+            valid_indices = [raw.ch_names.index(ch) for ch in raw_topo.ch_names]
+            psd_mean_clean = psd_data[:, valid_indices, :].mean(axis=(0, 2))
 
             fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
             
-            # رسم خريطة الطاقات المكانية الحقيقية على سطح الرأس
             mne.viz.plot_topomap(
-                psd_mean,
+                psd_mean_clean,
                 raw_topo.info,
                 axes=ax_topo,
                 show=False,
                 contours=6,
-                sensors=True,
-                outlines='head'
+                sensors=True
             )
             ax_topo.set_title("Spatial Power Spectral Density")
 
@@ -263,7 +270,7 @@ if uploaded_file is not None:
 
             st.pyplot(fig_topo)
         except Exception as e:
-            st.error(f"حدث خطأ أثناء معالجة الخريطة المكانية: {e}")
+            st.warning(f"تنبيه تقني: تعذر معالجة الخريطة: {e}")
 
     # ح) توليد زر تحميل التقرير الطبي المعتمد
     pdf_path = generate_clinical_pdf_report(
