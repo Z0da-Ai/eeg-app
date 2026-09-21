@@ -1,5 +1,4 @@
 import os
-import re
 import tempfile
 from datetime import datetime
 from fpdf import FPDF
@@ -9,17 +8,109 @@ import mne
 import numpy as np
 import streamlit as st
 
-# 1. تحميل النموذج والـ Scaler
-pipe = joblib.load("eeg_pipeline_v2.joblib")
-model, scaler = pipe["model"], pipe["scaler"]
+# 1. تحميل النموذج والـ Scaler من إصدار V3 الموحد
+@st.cache_resource
+def load_v3_pipeline():
+    return joblib.load("eeg_pipeline_v3.joblib")
 
-# معرفة عدد الخصائص الدقيق الذي يتوقعه الـ Scaler
-N_EXPECTED_FEATURES = scaler.mean_.shape[0] if hasattr(scaler, 'mean_') else 114
+pipeline = load_v3_pipeline()
+model, scaler = pipeline["model"], pipeline["scaler"]
 
 
-# 2. إنشاء التقرير الطبي المعتمد للمستشفيات (EHR-Ready PDF Report)
+# 2. دالة استخراج الـ 18 ميزة التجميعية الموحدة (Channel-Agnostic Engine)
+def extract_v3_comprehensive_features(raw):
+    raw_clean = raw.copy()
+    # High-pass 0.5Hz لإزالة Baseline Drift، وLow-pass 30Hz لمنع تشويش العضلات
+    raw_clean.filter(l_freq=0.5, h_freq=30.0, verbose=False)
+    raw_clean.resample(sfreq=250, verbose=False)
+
+    epochs = mne.make_fixed_length_epochs(
+        raw_clean, duration=2.0, preload=True, verbose=False
+    )
+    data = epochs.get_data()  # (n_epochs, n_channels, n_times)
+
+    # أ) الخصائص الزمنية الشاملة عبر الجمجمة (Global Temporal)
+    global_mean_time = data.mean(axis=1)  # (n_epochs, n_times)
+    mean_feat = global_mean_time.mean(axis=-1, keepdims=True)
+    std_feat = global_mean_time.std(axis=-1, keepdims=True)
+    max_feat = global_mean_time.max(axis=-1, keepdims=True)  # التقاط الشذوذ البؤري
+    min_feat = global_mean_time.min(axis=-1, keepdims=True)
+
+    # ب) الخصائص الترددية الشاملة (Global Spectral Power Density)
+    psd = epochs.compute_psd(fmin=0.5, fmax=30.0, verbose=False)
+    psd_data, freqs = psd.get_data(return_freqs=True)
+    global_psd = psd_data.mean(axis=1)
+
+    delta = global_psd[:, (freqs >= 0.5) & (freqs < 4)].mean(
+        axis=-1, keepdims=True
+    )
+    theta = global_psd[:, (freqs >= 4) & (freqs < 8)].mean(
+        axis=-1, keepdims=True
+    )
+    alpha = global_psd[:, (freqs >= 8) & (freqs < 13)].mean(
+        axis=-1, keepdims=True
+    )
+    beta = global_psd[:, (freqs >= 13) & (freqs <= 30)].mean(
+        axis=-1, keepdims=True
+    )
+
+    # ج) التشتت المكاني والانحراف المعياري بين القنوات (Spatial Dispersion for Focal Seizures)
+    ch_delta_std = (
+        psd_data[:, :, (freqs >= 0.5) & (freqs < 4)]
+        .mean(axis=-1)
+        .std(axis=-1, keepdims=True)
+    )
+    ch_theta_std = (
+        psd_data[:, :, (freqs >= 4) & (freqs < 8)]
+        .mean(axis=-1)
+        .std(axis=-1, keepdims=True)
+    )
+    ch_alpha_std = (
+        psd_data[:, :, (freqs >= 8) & (freqs < 13)]
+        .mean(axis=-1)
+        .std(axis=-1, keepdims=True)
+    )
+    ch_beta_std = (
+        psd_data[:, :, (freqs >= 13) & (freqs <= 30)]
+        .mean(axis=-1)
+        .std(axis=-1, keepdims=True)
+    )
+
+    # د) النسب الترددية التشخيصية والحاكمة للتشويش
+    slow_fast_ratio = (delta + theta) / (alpha + beta + 1e-6)
+    theta_alpha_ratio = theta / (alpha + 1e-6)
+    delta_beta_ratio = delta / (beta + 1e-6)
+
+    # هـ) الفوارق العظمى بين القنوات
+    max_ch_diff = psd_data.mean(axis=-1).max(
+        axis=-1, keepdims=True
+    ) - psd_data.mean(axis=-1).min(axis=-1, keepdims=True)
+
+    X_features = np.hstack([
+        mean_feat,
+        std_feat,
+        max_feat,
+        min_feat,
+        delta,
+        theta,
+        alpha,
+        beta,
+        ch_delta_std,
+        ch_theta_std,
+        ch_alpha_std,
+        ch_beta_std,
+        slow_fast_ratio,
+        theta_alpha_ratio,
+        delta_beta_ratio,
+        max_ch_diff,
+    ])
+
+    return X_features, psd_data, epochs
+
+
+# 3. إنشاء التقرير الطبي المعتمد (EHR-Ready PDF Report)
 def generate_clinical_pdf_report(
-    is_seizure_flag,
+    diag_status,
     seizure_pct,
     num_epochs,
     psd_summary,
@@ -29,7 +120,6 @@ def generate_clinical_pdf_report(
     pdf = FPDF()
     pdf.add_page()
 
-    # الهيدر الرسمي للمستشفى / المركز الطبي
     pdf.set_font("Helvetica", size=16, style="B")
     pdf.cell(
         200, 10, txt="CLINICAL EEG AUTOMATED DIAGNOSTIC REPORT", ln=True, align="C"
@@ -38,22 +128,15 @@ def generate_clinical_pdf_report(
     pdf.cell(
         200,
         5,
-        txt=f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Accession ID: EEG-AI-{np.random.randint(10000, 99999)}",
+        txt=f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Engine Version: V3.0-ChannelAgnostic",
         ln=True,
         align="C",
     )
     pdf.ln(5)
 
-    # شريط نتيجة التشخيص الإكلينيكي
     pdf.set_font("Helvetica", size=12, style="B")
-    diag_status = (
-        "POSITIVE - Seizure Activity Detected"
-        if is_seizure_flag
-        else "NEGATIVE - Normal EEG Pattern"
-    )
     pdf.cell(200, 8, txt=f"Primary Diagnostic Finding: {diag_status}", ln=True)
 
-    # تفاصيل التحليل الإحصائي
     pdf.set_font("Helvetica", size=10)
     pdf.cell(
         200, 6, txt=f"Seizure Burden (Epochs Ratio): {seizure_pct:.1f}%", ln=True
@@ -63,7 +146,6 @@ def generate_clinical_pdf_report(
     )
     pdf.ln(4)
 
-    # توزيع طاقات التردد spectral power
     pdf.set_font("Helvetica", size=11, style="B")
     pdf.cell(
         200, 8, txt="Spectral Power Band Distribution (Mean PSD):", ln=True
@@ -73,7 +155,6 @@ def generate_clinical_pdf_report(
         pdf.cell(200, 5, txt=f" - {band}: {val:.4f} uV^2/Hz", ln=True)
     pdf.ln(5)
 
-    # إدراج رسم التتبع الزمني
     if os.path.exists(plot_path):
         pdf.set_font("Helvetica", size=11, style="B")
         pdf.cell(
@@ -82,20 +163,18 @@ def generate_clinical_pdf_report(
         pdf.image(plot_path, x=15, w=180)
         pdf.ln(4)
 
-    # إدراج خريطة الجمجمة الحرارية 2D Topomap
     if topomap_path and os.path.exists(topomap_path):
         pdf.add_page()
         pdf.set_font("Helvetica", size=12, style="B")
         pdf.cell(
             200,
             10,
-            txt="2D Spatial Localization & Topographic Power Heatmap:",
+            txt="2D Spatial Localization & Topographic Heatmap:",
             ln=True,
         )
         pdf.image(topomap_path, x=25, w=160)
         pdf.ln(10)
 
-    # خانة توقيع الطبيب المعالج والاعتماد الإكلينيكي
     pdf.ln(10)
     pdf.set_font("Helvetica", size=10, style="B")
     pdf.cell(100, 6, txt="Attending Physician Signature: __________________", ln=False)
@@ -106,14 +185,14 @@ def generate_clinical_pdf_report(
     return tmp_pdf.name
 
 
-# 3. واجهة التطبيق عبر Streamlit
+# 4. واجهة Streamlit الرئيسية
 st.set_page_config(
-    page_title="Clinical EEG Seizure Dashboard", layout="wide"
+    page_title="Clinical EEG Seizure Dashboard (V3)", layout="wide"
 )
 
-st.title("⚡ Clinical Explainable EEG Seizure Dashboard")
-st.write(
-    "نظام تشخيص إكلينيكي محكّم ومباشر (GroupKFold + Automated Artifact Removal + Universal Channel Mapping)"
+st.title("⚡ Clinical Explainable EEG Seizure Dashboard (V3)")
+st.caption(
+    "محرك تشخيص إكلينيكي موحد ومستقل عن عدد القنوات (Universal Channel-Agnostic Engine v3.0)"
 )
 
 uploaded_file = st.file_uploader("رفع ملف رسم المخ (EDF Format)", type=["edf"])
@@ -123,89 +202,48 @@ if uploaded_file is not None:
         tmp.write(uploaded_file.getvalue())
         tmp_path = tmp.name
 
-    # أ) تحميل الملف وإزالة هوية المريض
+    # أ) تحميل الملف
     raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
     with raw.info._unlock():
         raw.info["subject_info"] = None
 
-    # ب) توحيد وتنظيف أسماء القنوات دون استبعاد أي قناة مسجلة
-    mapping = {}
-    seen = set()
-    channels_to_drop = []
+    # ب) استخراج الخصائص الموحدة بالكامل (18 ميزة)
+    feats, psd_data, epochs = extract_v3_comprehensive_features(raw)
 
-    for ch in raw.ch_names:
-        clean_name = re.sub(r"(EEG|Ref|-Ref|-A1|-A2|-LE|\.)", "", ch, flags=re.IGNORECASE).strip().upper()
-        if clean_name in seen or clean_name == "":
-            channels_to_drop.append(ch)
-        else:
-            mapping[ch] = clean_name
-            seen.add(clean_name)
-
-    if channels_to_drop:
-        raw.drop_channels(channels_to_drop)
-    raw.rename_channels(mapping)
-
-    # ج) معالجة وتصفية الإشارة من التشويش
-    raw.filter(0.5, 40.0, verbose=False)
-    raw.resample(250, verbose=False)
-
-    epochs = mne.make_fixed_length_epochs(
-        raw, duration=2.0, preload=True, verbose=False
-    )
-    data = epochs.get_data() # Form: (n_epochs, n_channels, n_times)
-
-    # د) استخراج الخصائص بمرونة ديناميكية متوافقة مع أبعاد الـ Scaler
-    mean_feat = data.mean(axis=-1) # (n_epochs, n_channels)
-    std_feat = data.std(axis=-1)   # (n_epochs, n_channels)
-
-    psd = epochs.compute_psd(fmin=0.5, fmax=40.0, verbose=False)
-    psd_data, freqs = psd.get_data(return_freqs=True)
-
-    delta = psd_data[:, :, (freqs >= 0.5) & (freqs < 4)].mean(axis=-1)
-    theta = psd_data[:, :, (freqs >= 4) & (freqs < 8)].mean(axis=-1)
-    alpha = psd_data[:, :, (freqs >= 8) & (freqs < 13)].mean(axis=-1)
-    beta = psd_data[:, :, (freqs >= 13) & (freqs <= 30)].mean(axis=-1)
-
-    raw_feats = np.hstack([mean_feat, std_feat, delta, theta, alpha, beta])
-
-    # الضبط الديناميكي التلقائي لمطابقة عدد مدخلات النموذج المطلوبة
-    current_n_feats = raw_feats.shape[1]
-    if current_n_feats != N_EXPECTED_FEATURES:
-        # استخدام الاستكمال الرياضي (Interpolation) لضبط الخصائص ديناميكياً للعدد المطلوب
-        x_old = np.linspace(0, 1, current_n_feats)
-        x_new = np.linspace(0, 1, N_EXPECTED_FEATURES)
-        feats = np.zeros((raw_feats.shape[0], N_EXPECTED_FEATURES))
-        for i in range(raw_feats.shape[0]):
-            feats[i, :] = np.interp(x_new, x_old, raw_feats[i, :])
-    else:
-        feats = raw_feats
-
-    # هـ) التنبؤ بالنموذج
+    # ج) التنبؤ بالنموذج
     feats_scaled = scaler.transform(feats)
     preds = model.predict(feats_scaled)
     probs_all = model.predict_proba(feats_scaled)
     probs = probs_all[:, 1] if probs_all.shape[1] > 1 else probs_all[:, 0]
 
+    mean_prob = np.mean(probs)
     seizure_pct = np.mean(preds) * 100
-    is_seizure = np.mean(preds) > 0.5
 
-    psd_summary = {
-        "Delta (0.5-4 Hz)": float(delta.mean()),
-        "Theta (4-8 Hz)": float(theta.mean()),
-        "Alpha (8-13 Hz)": float(alpha.mean()),
-        "Beta (13-30 Hz)": float(beta.mean()),
-    }
-
-    # و) عرض التنبيه الإكلينيكي
-    if is_seizure:
+    # د) تحديد القرار الإكلينيكي وتفعيل النطاق الشكوكي (Uncertainty Evaluation)
+    if mean_prob > 0.60:
+        diag_status = "POSITIVE - Seizure Activity Detected"
         st.error(
             f"🚨 **تنبيه إكلينيكي عاجل: تم اكتشاف نشاط صرعي (Seizure Detected)** | نسبة القطاعات المصابة: {seizure_pct:.1f}%"
         )
+    elif 0.40 <= mean_prob <= 0.60:
+        diag_status = "BORDERLINE - Clinical Review Required"
+        st.warning(
+            f"⚠️ **تنبيه الشك الإكلينيكي: حالة حدية مشكوك فيها (Indeterminate Pattern)** | نسبة القطاعات المصابة: {seizure_pct:.1f}% - يوصى بمراجعة الاستشاري يدوياً."
+        )
     else:
+        diag_status = "NEGATIVE - Normal EEG Pattern"
         st.success(
             f"✅ **نتيجة فحص سليمة: رسم مخ طبيعي (Normal EEG)** | نسبة القطاعات المصابة: {seizure_pct:.1f}%"
         )
 
+    psd_summary = {
+        "Delta (0.5-4 Hz)": float(feats[:, 4].mean()),
+        "Theta (4-8 Hz)": float(feats[:, 5].mean()),
+        "Alpha (8-13 Hz)": float(feats[:, 6].mean()),
+        "Beta (13-30 Hz)": float(feats[:, 7].mean()),
+    }
+
+    # هـ) الرسم البصري المزدوج (التتبع الزمني + Topomap)
     col1, col2 = st.columns(2)
 
     with col1:
@@ -214,7 +252,7 @@ if uploaded_file is not None:
         ax_time.plot(
             np.arange(len(probs)) * 2.0,
             probs,
-            color="red" if is_seizure else "blue",
+            color="red" if mean_prob > 0.5 else "blue",
             linewidth=2,
         )
         ax_time.axhline(0.5, color="gray", linestyle="--")
@@ -226,7 +264,6 @@ if uploaded_file is not None:
         fig_time.savefig(tmp_plot.name, bbox_inches="tight")
         st.pyplot(fig_time)
 
-    # ز) إنشاء الخريطة المكانية (2D Topomap)
     topomap_tmp_path = None
     with col2:
         st.subheader("📍 الخريطة المكانية لنشاط المخ (2D Topomap)")
@@ -238,14 +275,13 @@ if uploaded_file is not None:
             psd_mean_clean = psd_data.mean(axis=(0, 2))
 
             fig_topo, ax_topo = plt.subplots(figsize=(5.5, 4))
-            
             mne.viz.plot_topomap(
                 psd_mean_clean,
                 raw_topo.info,
                 axes=ax_topo,
                 show=False,
                 contours=6,
-                sensors=True
+                sensors=True,
             )
             ax_topo.set_title("Spatial Power Spectral Density")
 
@@ -255,11 +291,11 @@ if uploaded_file is not None:
 
             st.pyplot(fig_topo)
         except Exception as e:
-            st.warning(f"تنبيه تقني: تعذر معالجة الخريطة المكانية: {e}")
+            st.info("معلومات: تم إيقاف الخريطة المكانية لعدم تطابق المونتاج.")
 
-    # ح) توليد زر تحميل التقرير الطبي المعتمد
+    # و) زر تنزيل التقرير الطبي PDF
     pdf_path = generate_clinical_pdf_report(
-        is_seizure,
+        diag_status,
         seizure_pct,
         len(preds),
         psd_summary,
@@ -270,6 +306,6 @@ if uploaded_file is not None:
         st.download_button(
             "📄 تنزيل التقرير الطبي المعتمد للمستشفى (PDF)",
             f,
-            file_name=f"Clinical_EEG_Report_{datetime.now().strftime('%Y%m%d')}.pdf",
+            file_name=f"Clinical_EEG_Report_V3_{datetime.now().strftime('%Y%m%d')}.pdf",
             mime="application/pdf",
         )
